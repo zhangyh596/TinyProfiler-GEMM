@@ -1,0 +1,7 @@
+# 构建产物
+build/
+build-linux/
+
+# 编辑器 / 系统
+.vscode/
+.DS_Store
