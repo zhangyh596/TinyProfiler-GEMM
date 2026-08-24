@@ -7,7 +7,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 add_executable(gemm main.cpp)
 
-# 编译加速: 激活 CPU 本机向量化指令集 (AVX2/AVX-512) 与 FMA 乘加融合
+# 编译加速: 激活 CPU 本机向量化指令集 (AVX2/FMA) 与 FMA 乘加融合
 if(MSVC)
     target_compile_options(gemm PRIVATE /O2 /arch:AVX2 /fp:fast)
 else()
