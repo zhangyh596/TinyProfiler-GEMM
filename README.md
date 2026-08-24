@@ -83,7 +83,7 @@ cmake --build build
 ./build/gemm
 ```
 
-> 说明：`-march=native` 会针对**当前 CPU** 生成指令（如 AVX2 / AVX-512），
+> 说明：`-march=native` 会针对**当前 CPU** 生成指令（如 AVX2 / FMA），
 > 换机器运行可能触发 `Illegal instruction`。若要发布到其他机器，请改用固定目标
 > `-march=x86-64-v3`（AVX2）或 `-march=x86-64-v4`（AVX-512）。
 
@@ -118,7 +118,7 @@ for (i) for (k) {
 - **64B 对齐**：放弃 `std::vector` 默认分配，改为 Heap 上 64 字节对齐的连续内存
   （Windows/MinGW 无 `std::aligned_alloc`/`posix_memalign`，采用经典手动对齐：
   `malloc` 多分配 `ALIGN-1+sizeof(void*)`，原始指针存于对齐地址之前，`free` 释放原始指针）；
-- **向量化**：`-march=native` 显式激活 AVX2/AVX-512；
+- **向量化**：`-march=native` 显式激活 AVX2/FMA；
 - **FMA 融合**：`a*b+c` 融合为单条 `vfmadd231pd` 乘加指令，并启用 `-ffast-math`。
 
 ---
