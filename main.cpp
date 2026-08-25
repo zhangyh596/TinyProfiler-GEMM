@@ -1,16 +1,18 @@
-// GEMM Phase 4/5: Cache Blocking (矩阵分块) + AVX2 寄存器分块微内核
-// 在 Phase 3 (i-k-j + 64B 对齐 + AVX2/FMA + -ffast-math) 基础上:
-//   Phase 4  将 N×N 矩阵按 block×block 分块, 使 A/B/C 的 tile 常驻 cache,
-//            大幅减少大矩阵 (如 8192×8192) 下 B 的重复 DRAM 读取与 TLB 压力。
-//   Phase 5  在分块内部再用 MR×NR 寄存器分块 (AVX2 _mm256_fmadd_pd),
-//            把 C 的 MR×NR 小块常驻 YMM 寄存器, 消除 C 的重复 load/store,
-//            让每个 FMA 都真正贡献到计算吞吐。
+// GEMM 分层优化实验: i-j-k -> i-k-j -> 对齐/SIMD -> 矩阵分块 -> AVX2 微内核
+//                    -> Packing 数据重排 -> OpenMP 多线程。
+//
+//   Phase 1  i-j-k 朴素 baseline
+//   Phase 3  i-k-j + 64B 对齐 + AVX2/FMA + -ffast-math
+//   Phase 4  矩阵分块 (Cache Blocking, 块内 i-k-j 标量)
+//   Phase 5  分块 + AVX2 寄存器分块微内核 (MR=8 x NR=4)
+//   Phase 6  分块 + Packing 数据重排 + 微内核 (MR=4 x NR=8)
+//   Phase 7  Phase 6 + OpenMP 多线程 (并行 i0 行块)
 //
 // 用法:
 //   gemm [N] [block] [--tune]
 //     N      方阵维度, 默认 1024
 //     block  分块大小, 默认 64
-//     --tune 自动扫描一组 block 大小并给出建议
+//     --tune 自动扫描一组 block 大小 (Phase 6)
 //
 // 构建:
 //   cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build
@@ -28,10 +30,15 @@
 #include <cstdlib>
 #include <cstring>
 #include <random>
+#include <vector>
 
 #if defined(__AVX2__) && defined(__FMA__)
 #include <immintrin.h>
 #define GEMM_HAS_AVX2_FMA 1
+#endif
+
+#ifdef _OPENMP
+#include <omp.h>
 #endif
 
 namespace {
@@ -67,7 +74,7 @@ void init_matrices(std::size_t n, double* A, double* B) {
     }
 }
 
-// Phase 1: 朴素 i-j-k (baseline / 参考实现)
+// ---------- Phase 1: 朴素 i-j-k ----------
 void gemm_naive(std::size_t n, const double* A, const double* B, double* C) {
     for (std::size_t i = 0; i < n; ++i) {
         for (std::size_t j = 0; j < n; ++j) {
@@ -78,7 +85,7 @@ void gemm_naive(std::size_t n, const double* A, const double* B, double* C) {
     }
 }
 
-// Phase 2/3: i-k-j (B 按行连续访问, C 第 i 行常驻 cache)
+// ---------- Phase 2/3: i-k-j ----------
 void gemm_ikj(std::size_t n, const double* __restrict A,
               const double* __restrict B, double* __restrict C) {
     for (std::size_t i = 0; i < n; ++i) {
@@ -93,9 +100,7 @@ void gemm_ikj(std::size_t n, const double* __restrict A,
     }
 }
 
-// Phase 4: Cache Blocking (矩阵分块), 块内仍为 i-k-j 标量形式
-// 循环顺序 i0 -> j0 -> k0: 对固定 (i0, j0), C 的 block×block tile 在整个
-// k0 循环期间常驻 L1/L2; 每次只搬入 B 与 A 的 block×block tile。
+// ---------- Phase 4: Cache Blocking (块内 i-k-j 标量) ----------
 void gemm_tiled(std::size_t n, const double* __restrict A,
                 const double* __restrict B, double* __restrict C,
                 std::size_t block) {
@@ -123,9 +128,7 @@ void gemm_tiled(std::size_t n, const double* __restrict A,
     }
 }
 
-// Phase 5: Cache Blocking + AVX2 寄存器分块微内核
-// MR×NR 个累加器常驻 YMM 寄存器, 内层沿 k 做 FMA, C 只在进出微内核时
-// load/store 一次, 极大降低访存指令占比。
+// ---------- Phase 5: Cache Blocking + AVX2 寄存器分块微内核 ----------
 #if GEMM_HAS_AVX2_FMA
 constexpr std::size_t MR = 8;  // 微内核一次处理的行数
 constexpr std::size_t NR = 4;  // 微内核一次处理的列数 (一个 256-bit 向量 = 4 double)
@@ -143,7 +146,6 @@ void gemm_tiled_avx2(std::size_t n, const double* __restrict A,
                 const std::size_t ibulk = i_end - ((i_end - i0) % MR);
                 const std::size_t jbulk = j_end - ((j_end - j0) % NR);
 
-                // 主体: MR×NR 微内核, 覆盖 [i0, ibulk) × [j0, jbulk)
                 for (std::size_t i = i0; i < ibulk; i += MR) {
                     for (std::size_t j = j0; j < jbulk; j += NR) {
                         __m256d acc[MR];
@@ -151,8 +153,7 @@ void gemm_tiled_avx2(std::size_t n, const double* __restrict A,
                             acc[r] = _mm256_loadu_pd(&C[(i + r) * n + j]);
                         }
                         for (std::size_t k = k0; k < k_end; ++k) {
-                            const __m256d bv =
-                                _mm256_loadu_pd(&B[k * n + j]);
+                            const __m256d bv = _mm256_loadu_pd(&B[k * n + j]);
                             for (std::size_t r = 0; r < MR; ++r) {
                                 const __m256d av =
                                     _mm256_broadcast_sd(&A[(i + r) * n + k]);
@@ -165,7 +166,6 @@ void gemm_tiled_avx2(std::size_t n, const double* __restrict A,
                     }
                 }
 
-                // 余数: 主体行 [i0, ibulk) 中剩下的列 [jbulk, j_end)
                 for (std::size_t i = i0; i < ibulk; ++i) {
                     double* Ci = C + i * n;
                     const double* Ai = A + i * n;
@@ -177,8 +177,6 @@ void gemm_tiled_avx2(std::size_t n, const double* __restrict A,
                         }
                     }
                 }
-
-                // 余数: 剩下的行 [ibulk, i_end) 整行
                 for (std::size_t i = ibulk; i < i_end; ++i) {
                     double* Ci = C + i * n;
                     const double* Ai = A + i * n;
@@ -195,6 +193,140 @@ void gemm_tiled_avx2(std::size_t n, const double* __restrict A,
     }
 }
 #endif  // GEMM_HAS_AVX2_FMA
+
+// ---------- Phase 6: Packing 数据重排 + 微内核 (MR=4 x NR=8) ----------
+// A 面板按列优先打包 (A_pack[k*MC + r] = A[i0+r][k0+k]), 使固定 k 的 MR 个
+// A 元素连续存放 (一个 Cache Line), 微内核里广播 A 只碰 1 条 Cache Line;
+// B 面板按行打包, 每行用 memcpy 一次搬入, 微内核里 B 顺序流式复用。
+constexpr std::size_t PMR = 4;  // 打包微内核行数
+constexpr std::size_t PNR = 8;  // 打包微内核列数 (两个 256-bit 向量 = 8 double)
+
+void packed_i0_block(std::size_t n, const double* __restrict A,
+                     const double* __restrict B, double* __restrict C,
+                     std::size_t block, std::size_t i0,
+                     double* __restrict A_pack, double* __restrict B_pack) {
+    const std::size_t i_end = std::min(i0 + block, n);
+    const std::size_t MC = i_end - i0;
+
+    for (std::size_t k0 = 0; k0 < n; k0 += block) {
+        const std::size_t k_end = std::min(k0 + block, n);
+        const std::size_t KC = k_end - k0;
+
+        // pack A 面板: A_pack[k*MC + r] = A[(i0+r)*n + (k0+k)]
+        for (std::size_t k = 0; k < KC; ++k) {
+            const double* src = A + i0 * n + (k0 + k);
+            double* dst = A_pack + k * MC;
+            for (std::size_t r = 0; r < MC; ++r) {
+                dst[r] = src[r * n];
+            }
+        }
+
+        for (std::size_t j0 = 0; j0 < n; j0 += block) {
+            const std::size_t j_end = std::min(j0 + block, n);
+            const std::size_t NC = j_end - j0;
+
+            // pack B 面板: B_pack[k*NC + c] = B[(k0+k)*n + (j0+c)]
+            for (std::size_t k = 0; k < KC; ++k) {
+                std::memcpy(B_pack + k * NC, B + (k0 + k) * n + j0,
+                            NC * sizeof(double));
+            }
+
+#if GEMM_HAS_AVX2_FMA
+            const std::size_t ibulk = MC - (MC % PMR);
+            const std::size_t jbulk = NC - (NC % PNR);
+
+            // 主体微内核 [0, ibulk) x [0, jbulk)
+            for (std::size_t i = 0; i < ibulk; i += PMR) {
+                for (std::size_t j = 0; j < jbulk; j += PNR) {
+                    __m256d acc[PMR][2];
+                    for (std::size_t r = 0; r < PMR; ++r) {
+                        acc[r][0] =
+                            _mm256_loadu_pd(&C[(i0 + i + r) * n + (j0 + j)]);
+                        acc[r][1] =
+                            _mm256_loadu_pd(&C[(i0 + i + r) * n + (j0 + j) + 4]);
+                    }
+                    for (std::size_t k = 0; k < KC; ++k) {
+                        const __m256d b0 = _mm256_loadu_pd(B_pack + k * NC + j);
+                        const __m256d b1 =
+                            _mm256_loadu_pd(B_pack + k * NC + j + 4);
+                        for (std::size_t r = 0; r < PMR; ++r) {
+                            const __m256d a =
+                                _mm256_broadcast_sd(A_pack + k * MC + i + r);
+                            acc[r][0] = _mm256_fmadd_pd(a, b0, acc[r][0]);
+                            acc[r][1] = _mm256_fmadd_pd(a, b1, acc[r][1]);
+                        }
+                    }
+                    for (std::size_t r = 0; r < PMR; ++r) {
+                        _mm256_storeu_pd(&C[(i0 + i + r) * n + (j0 + j)],
+                                         acc[r][0]);
+                        _mm256_storeu_pd(&C[(i0 + i + r) * n + (j0 + j) + 4],
+                                         acc[r][1]);
+                    }
+                }
+            }
+#else
+            const std::size_t ibulk = 0;
+            const std::size_t jbulk = 0;
+#endif
+
+            // 余数: 剩下的行 [ibulk, MC) 全部列
+            for (std::size_t i = ibulk; i < MC; ++i) {
+                double* Ci = C + (i0 + i) * n;
+                const double* Ai = A + (i0 + i) * n;
+                for (std::size_t k = 0; k < KC; ++k) {
+                    const double a = Ai[k0 + k];
+                    const double* Bk = B + (k0 + k) * n;
+                    for (std::size_t j = 0; j < NC; ++j) {
+                        Ci[j0 + j] += a * Bk[j0 + j];
+                    }
+                }
+            }
+            // 余数: 主体行 [0, ibulk) 剩下的列 [jbulk, NC)
+            for (std::size_t i = 0; i < ibulk; ++i) {
+                double* Ci = C + (i0 + i) * n;
+                const double* Ai = A + (i0 + i) * n;
+                for (std::size_t k = 0; k < KC; ++k) {
+                    const double a = Ai[k0 + k];
+                    const double* Bk = B + (k0 + k) * n;
+                    for (std::size_t j = jbulk; j < NC; ++j) {
+                        Ci[j0 + j] += a * Bk[j0 + j];
+                    }
+                }
+            }
+        }
+    }
+}
+
+void gemm_packed(std::size_t n, const double* __restrict A,
+                 const double* __restrict B, double* __restrict C,
+                 std::size_t block) {
+    if (block == 0 || block > n) block = n;
+    std::vector<double> A_pack(block * block);
+    std::vector<double> B_pack(block * block);
+    for (std::size_t i0 = 0; i0 < n; i0 += block) {
+        packed_i0_block(n, A, B, C, block, i0, A_pack.data(), B_pack.data());
+    }
+}
+
+// ---------- Phase 7: Phase 6 + OpenMP 多线程 ----------
+void gemm_packed_omp(std::size_t n, const double* __restrict A,
+                     const double* __restrict B, double* __restrict C,
+                     std::size_t block) {
+    if (block == 0 || block > n) block = n;
+#if defined(_OPENMP)
+#pragma omp parallel
+    {
+        std::vector<double> A_pack(block * block);
+        std::vector<double> B_pack(block * block);
+#pragma omp for schedule(static)
+        for (std::size_t i0 = 0; i0 < n; i0 += block) {
+            packed_i0_block(n, A, B, C, block, i0, A_pack.data(), B_pack.data());
+        }
+    }
+#else
+    gemm_packed(n, A, B, C, block);
+#endif
+}
 
 double gflops_of(std::size_t n, double ms) {
     return 2.0 * static_cast<double>(n) * n * n / (ms * 1e-3) / 1e9;
@@ -224,6 +356,7 @@ int main(int argc, char** argv) {
     std::size_t N = 1024;
     std::size_t BLOCK = 64;
     bool tune = false;
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
 
     if (argc > 1) {
         const long v = std::strtol(argv[1], nullptr, 10);
@@ -242,99 +375,86 @@ int main(int argc, char** argv) {
     std::printf(" GEMM 性能测试  N = %zu  (单矩阵 %.1f MB)\n", N,
                 bytes_per_mat / 1e6);
 #if GEMM_HAS_AVX2_FMA
-    std::printf(" 向量化: AVX2 + FMA (微内核 MR=%zu x NR=%zu)\n", MR, NR);
+    std::printf(" 向量化: AVX2 + FMA  (Phase5: MR=%zu x NR=%zu | Phase6/7: MR=%zu x NR=%zu)\n",
+                MR, NR, PMR, PNR);
+#endif
+    std::printf(" 分块大小 block = %zu\n", BLOCK);
+#if defined(_OPENMP)
+    std::printf(" OpenMP: 可用 (最大线程 %d)\n", omp_get_max_threads());
+#else
+    std::printf(" OpenMP: 不可用 (未链接 -fopenmp)\n");
 #endif
     std::printf("============================================================\n");
 
     double* A = alloc_aligned64(N * N);
     double* B = alloc_aligned64(N * N);
-    double* C_ikj = alloc_aligned64(N * N);
-    double* C_tiled = alloc_aligned64(N * N);
-    double* C_avx2 = alloc_aligned64(N * N);
-    if (!A || !B || !C_ikj || !C_tiled || !C_avx2) {
+    double* C_ref = alloc_aligned64(N * N);   // i-k-j 参考结果 (兼作 Phase 3)
+    double* C_work = alloc_aligned64(N * N);  // 各优化阶段复用
+    if (!A || !B || !C_ref || !C_work) {
         std::printf("内存分配失败\n");
         free_aligned64(A);
         free_aligned64(B);
-        free_aligned64(C_ikj);
-        free_aligned64(C_tiled);
-        free_aligned64(C_avx2);
+        free_aligned64(C_ref);
+        free_aligned64(C_work);
         return 1;
     }
 
     init_matrices(N, A, B);
 
-    std::printf("64 字节对齐校验: A=%s B=%s C_ikj=%s C_tiled=%s C_avx2=%s\n",
+    std::printf("64 字节对齐校验: A=%s B=%s C_ref=%s C_work=%s\n",
                 is_aligned64(A) ? "OK" : "FAIL",
                 is_aligned64(B) ? "OK" : "FAIL",
-                is_aligned64(C_ikj) ? "OK" : "FAIL",
-                is_aligned64(C_tiled) ? "OK" : "FAIL",
-                is_aligned64(C_avx2) ? "OK" : "FAIL");
+                is_aligned64(C_ref) ? "OK" : "FAIL",
+                is_aligned64(C_work) ? "OK" : "FAIL");
 
-    // ---------- Phase 3: i-k-j (未分块) ----------
-    std::fill(C_ikj, C_ikj + N * N, 0.0);
-    double ms_ikj = 0.0;
+    // Phase 3: 生成参考结果并计时
+    std::fill(C_ref, C_ref + N * N, 0.0);
+    double ms3 = 0.0;
     {
         const auto t0 = std::chrono::steady_clock::now();
-        gemm_ikj(N, A, B, C_ikj);
+        gemm_ikj(N, A, B, C_ref);
         const auto t1 = std::chrono::steady_clock::now();
-        ms_ikj = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        ms3 = std::chrono::duration<double, std::milli>(t1 - t0).count();
         std::printf("[Phase 3] i-k-j (未分块)             : %9.1f ms  (%.3f GFLOPS)\n",
-                    ms_ikj, gflops_of(N, ms_ikj));
+                    ms3, gflops_of(N, ms3));
     }
 
-    // ---------- Phase 4: Cache Blocking ----------
-    std::fill(C_tiled, C_tiled + N * N, 0.0);
-    double ms_tiled = 0.0;
-    {
+    // 通用: 计时 + 全矩阵校验 (写入 C_work, 与 C_ref 比较)
+    auto bench = [&](const char* label, auto&& kernel) {
+        std::fill(C_work, C_work + N * N, 0.0);
         const auto t0 = std::chrono::steady_clock::now();
-        gemm_tiled(N, A, B, C_tiled, BLOCK);
+        kernel();
         const auto t1 = std::chrono::steady_clock::now();
-        ms_tiled = std::chrono::duration<double, std::milli>(t1 - t0).count();
-        std::printf("[Phase 4] i-k-j + Blocking(%4zu)     : %9.1f ms  (%.3f GFLOPS)\n",
-                    BLOCK, ms_tiled, gflops_of(N, ms_tiled));
-    }
+        const double ms =
+            std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::printf("%s %9.1f ms  (%.3f GFLOPS)\n", label, ms, gflops_of(N, ms));
+        const double e = max_rel_err(N, C_work, C_ref);
+        std::printf("    全矩阵校验 vs i-k-j: max 相对误差 = %.3e  %s\n", e,
+                    (e < 1e-9) ? "OK" : "FAIL");
+        return ms;
+    };
 
-    // ---------- Phase 5: Cache Blocking + AVX2 寄存器分块 ----------
-    double ms_avx2 = 0.0;
-    std::fill(C_avx2, C_avx2 + N * N, 0.0);
+    double ms4 = bench("[Phase 4] i-k-j + Blocking          :",
+                       [&] { gemm_tiled(N, A, B, C_work, BLOCK); });
+    double ms5 = 0.0, ms6 = 0.0, ms7 = 0.0;
 #if GEMM_HAS_AVX2_FMA
-    {
-        const auto t0 = std::chrono::steady_clock::now();
-        gemm_tiled_avx2(N, A, B, C_avx2, BLOCK);
-        const auto t1 = std::chrono::steady_clock::now();
-        ms_avx2 = std::chrono::duration<double, std::milli>(t1 - t0).count();
-        std::printf("[Phase 5] + AVX2 寄存器分块微内核    : %9.1f ms  (%.3f GFLOPS)\n",
-                    ms_avx2, gflops_of(N, ms_avx2));
-    }
-#else
-    std::printf("[Phase 5] + AVX2 寄存器分块微内核    : 不可用 (需 -march=native/AVX2)\n");
+    ms5 = bench("[Phase 5] + AVX2 微内核 (8x4)       :",
+                [&] { gemm_tiled_avx2(N, A, B, C_work, BLOCK); });
 #endif
+    ms6 = bench("[Phase 6] + Packing 微内核 (4x8)     :",
+                [&] { gemm_packed(N, A, B, C_work, BLOCK); });
+    ms7 = bench("[Phase 7] + OpenMP 多线程            :",
+                [&] { gemm_packed_omp(N, A, B, C_work, BLOCK); });
 
-    // ---------- 正确性校验 ----------
-    const double err4 = max_rel_err(N, C_tiled, C_ikj);
-    std::printf("------------------------------------------------------------\n");
-    std::printf("全矩阵校验 C_tiled vs C_ikj : max 相对误差 = %.3e  %s\n", err4,
-                (err4 < 1e-9) ? "OK" : "FAIL");
-#if GEMM_HAS_AVX2_FMA
-    const double err5 = max_rel_err(N, C_avx2, C_ikj);
-    std::printf("全矩阵校验 C_avx2  vs C_ikj : max 相对误差 = %.3e  %s\n", err5,
-                (err5 < 1e-9) ? "OK" : "FAIL");
-#endif
-
-    // 抽样校验: 与独立点积参考值对比 (覆盖任意 N, 复杂度 O(N)/元素)
+    // 抽样校验 (独立点积)
     {
         std::mt19937_64 rng(20260825ULL);
         std::uniform_int_distribution<std::size_t> dist(0, N - 1);
         double werr = 0.0;
-#if GEMM_HAS_AVX2_FMA
-        const double* Cchk = C_avx2;
-#else
-        const double* Cchk = C_tiled;
-#endif
         for (int s = 0; s < 16; ++s) {
             const std::size_t r = dist(rng), c = dist(rng);
             const double ref = dot_ref(N, A, B, r, c);
-            const double got = Cchk[r * N + c];
+            const double got = C_work[r * N + c];
             const double denom = std::fabs(ref) > 1e-30 ? std::fabs(ref) : 1e-30;
             werr = std::max(werr, std::fabs(got - ref) / denom);
         }
@@ -342,40 +462,26 @@ int main(int argc, char** argv) {
                     werr, (werr < 1e-9) ? "OK" : "FAIL");
     }
 
-    // ---------- 小矩阵补测 Phase 1 朴素版作为 baseline ----------
+    // 小矩阵补测 Phase 1 朴素 baseline
     if (N <= 1024) {
-        double* C_naive = alloc_aligned64(N * N);
-        if (C_naive) {
-            std::fill(C_naive, C_naive + N * N, 0.0);
-            const auto t0 = std::chrono::steady_clock::now();
-            gemm_naive(N, A, B, C_naive);
-            const auto t1 = std::chrono::steady_clock::now();
-            const double ms =
-                std::chrono::duration<double, std::milli>(t1 - t0).count();
-            std::printf("[Phase 1] i-j-k (朴素 baseline)      : %9.1f ms  (%.3f GFLOPS)\n",
-                        ms, gflops_of(N, ms));
-            const double e = max_rel_err(N, C_ikj, C_naive);
-            std::printf("全矩阵校验 C_ikj vs C_naive : max 相对误差 = %.3e  %s\n", e,
-                        (e < 1e-9) ? "OK" : "FAIL");
-            free_aligned64(C_naive);
-        }
+        bench("[Phase 1] i-j-k (朴素 baseline)      :",
+              [&] { gemm_naive(N, A, B, C_work); });
     } else {
         std::printf("[Phase 1] i-j-k (朴素 baseline)      : 跳过 (N > 1024, 过于缓慢)\n");
     }
 
-    // ---------- 自动调优 block 大小 ----------
-#if GEMM_HAS_AVX2_FMA
+    // --tune: 扫描 Phase 6 的 block 大小
     if (tune) {
         const std::size_t candidates[] = {32, 48, 64, 96, 128, 160, 192, 256};
         std::size_t best = BLOCK;
-        double best_ms = ms_avx2;
+        double best_ms = ms6;
         std::printf("------------------------------------------------------------\n");
-        std::printf("Block 调优 (Phase 5):\n");
+        std::printf("Block 调优 (Phase 6, Packing):\n");
         for (std::size_t b : candidates) {
             if (b > N) continue;
-            std::fill(C_avx2, C_avx2 + N * N, 0.0);
+            std::fill(C_work, C_work + N * N, 0.0);
             const auto t0 = std::chrono::steady_clock::now();
-            gemm_tiled_avx2(N, A, B, C_avx2, b);
+            gemm_packed(N, A, B, C_work, b);
             const auto t1 = std::chrono::steady_clock::now();
             const double m =
                 std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -388,23 +494,27 @@ int main(int argc, char** argv) {
         }
         std::printf("建议 block = %zu\n", best);
     }
-#endif
 
     std::printf("------------------------------------------------------------\n");
-    if (ms_ikj > 0.0 && ms_tiled > 0.0) {
-        std::printf("Phase3 -> Phase4 加速比: %.2fx\n", ms_ikj / ms_tiled);
-#if GEMM_HAS_AVX2_FMA
-        if (ms_avx2 > 0.0) {
-            std::printf("Phase3 -> Phase5 加速比: %.2fx\n", ms_ikj / ms_avx2);
-        }
-#endif
+    if (ms3 > 0.0) {
+        if (ms4 > 0.0) std::printf("Phase3 -> Phase4 加速比: %.2fx\n", ms3 / ms4);
+        if (ms5 > 0.0) std::printf("Phase3 -> Phase5 加速比: %.2fx\n", ms3 / ms5);
+        if (ms6 > 0.0) std::printf("Phase3 -> Phase6 加速比: %.2fx\n", ms3 / ms6);
+        if (ms7 > 0.0) std::printf("Phase3 -> Phase7 加速比: %.2fx\n", ms3 / ms7);
     }
 
     free_aligned64(A);
     free_aligned64(B);
-    free_aligned64(C_ikj);
-    free_aligned64(C_tiled);
-    free_aligned64(C_avx2);
+    free_aligned64(C_ref);
+    free_aligned64(C_work);
     return 0;
 }
+
+
+
+
+
+
+
+
 

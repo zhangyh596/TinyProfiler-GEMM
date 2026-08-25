@@ -14,3 +14,12 @@ if(MSVC)
 else()
     target_compile_options(gemm PRIVATE -O3 -march=native -ffast-math)
 endif()
+
+# OpenMP 多线程 (Phase 7)。默认开启; 找不到 OpenMP 时自动退化为单线程。
+option(GEMM_OPENMP "Enable OpenMP multithreading (Phase 7)" ON)
+if(GEMM_OPENMP)
+    find_package(OpenMP)
+    if(OpenMP_CXX_FOUND)
+        target_link_libraries(gemm PRIVATE OpenMP::OpenMP_CXX)
+    endif()
+endif()
